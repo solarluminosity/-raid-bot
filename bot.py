@@ -26,6 +26,7 @@ MAX_RESERVE = 5
 ROLE_LIMITS = {"tank": 1, "heal": 2, "dd": 7}
 ROLE_LABELS = {"tank": "Танк", "heal": "Хил", "dd": "ДД"}
 ROLE_EMOJIS = {"tank": "🛡️", "heal": "🌿", "dd": "⚔️"}
+FIXED_ALERT_MINUTES = 5
 
 
 @dataclass
@@ -37,7 +38,6 @@ class RaidState:
     thread_id: int | None
     title: str
     start_ts: int
-    alert_before_minutes: int
     main: dict[str, list[int]] = field(default_factory=lambda: {"tank": [], "heal": [], "dd": []})
     reserve: dict[str, list[int]] = field(default_factory=lambda: {"tank": [], "heal": [], "dd": []})
     sent_alerts: list[str] = field(default_factory=list)
@@ -73,7 +73,6 @@ class RaidState:
             "thread_id": self.thread_id,
             "title": self.title,
             "start_ts": self.start_ts,
-            "alert_before_minutes": self.alert_before_minutes,
             "main": self.main,
             "reserve": self.reserve,
             "sent_alerts": self.sent_alerts,
@@ -173,7 +172,8 @@ def build_raid_embed(raid: RaidState) -> discord.Embed:
 
     status = "Завершён" if raid.ended else "Активен"
     embed.set_footer(
-        text=f"Статус: {status} • Напоминания: за 60 мин, за {raid.alert_before_minutes} мин и в момент старта"
+        text="Статус: "
+        f"{status} • Напоминания: за 60 мин, за 5 мин и в момент старта"
     )
     return embed
 
@@ -347,27 +347,38 @@ async def on_ready() -> None:
     title="Название рейда",
     date="Дата в формате ДД.ММ.ГГГГ",
     time_msk="Время по МСК в формате ЧЧ:ММ",
-    alert_before="Второе напоминание: 5 или 10 минут",
-    channel="Канал, куда отправить рейд (если не указать — текущий)",
-)
-@app_commands.choices(
-    alert_before=[
-        app_commands.Choice(name="5 минут", value=5),
-        app_commands.Choice(name="10 минут", value=10),
-    ]
 )
 async def raid_create(
     interaction: discord.Interaction,
     title: str,
     date: str,
     time_msk: str,
-    alert_before: app_commands.Choice[int],
-    channel: discord.TextChannel | None = None,
 ) -> None:
-    target_channel = channel or interaction.channel
-    if not isinstance(target_channel, discord.TextChannel):
-        await interaction.response.send_message("Эта команда работает только в текстовом канале.", ephemeral=True)
+    raid_channel_id = os.getenv("RAID_CHANNEL_ID")
+    if not raid_channel_id or not raid_channel_id.isdigit():
+        await interaction.response.send_message(
+            "Не настроен RAID_CHANNEL_ID в Railway.",
+            ephemeral=True,
+        )
         return
+
+    try:
+        target_channel_obj = bot.get_channel(int(raid_channel_id)) or await bot.fetch_channel(int(raid_channel_id))
+    except discord.HTTPException:
+        await interaction.response.send_message(
+            "Не удалось найти канал для рейдов. Проверь RAID_CHANNEL_ID.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(target_channel_obj, discord.TextChannel):
+        await interaction.response.send_message(
+            "RAID_CHANNEL_ID должен указывать на текстовый канал.",
+            ephemeral=True,
+        )
+        return
+
+    target_channel = target_channel_obj
 
     try:
         start_dt = datetime.strptime(f"{date} {time_msk}", "%d.%m.%Y %H:%M").replace(tzinfo=MOSCOW_TZ)
@@ -399,7 +410,6 @@ async def raid_create(
         thread_id=thread.id,
         title=title,
         start_ts=int(start_dt.timestamp()),
-        alert_before_minutes=alert_before.value,
     )
     store.add(raid)
 
@@ -411,8 +421,7 @@ async def raid_create(
     await store.save()
 
     await interaction.followup.send(
-        f"Готово. Рейд создан в {target_channel.mention}.\n"
-        f"Ветка обсуждения: {thread.mention}",
+        f"Готово. Рейд создан в {target_channel.mention}.",
         ephemeral=True,
     )
 
@@ -479,7 +488,7 @@ async def scheduler() -> None:
 
         alerts = {
             "60": start_dt - timedelta(hours=1),
-            str(raid.alert_before_minutes): start_dt - timedelta(minutes=raid.alert_before_minutes),
+            "5": start_dt - timedelta(minutes=FIXED_ALERT_MINUTES),
             "start": start_dt,
         }
 
@@ -492,7 +501,7 @@ async def scheduler() -> None:
                 elif key == "start":
                     text = f"🚨 **Рейд {raid.title} начинается прямо сейчас!**\nУчастники: {raid.mentions_main()}"
                 else:
-                    text = f"⚠️ **До рейда {raid.title} осталось {raid.alert_before_minutes} мин!**\nУчастники: {raid.mentions_main()}"
+                    text = f"⚠️ **До рейда {raid.title} осталось 5 мин!**\nУчастники: {raid.mentions_main()}"
 
                 await send_and_autodelete(channel, text)
                 raid.sent_alerts.append(key)
