@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 
 logging.basicConfig(
@@ -73,6 +73,10 @@ class RaidState:
 
     ended: bool = False
 
+    notified_30: bool = False
+    notified_15: bool = False
+    notified_start: bool = False
+
     @property
     def start_dt(self) -> datetime:
         return datetime.fromtimestamp(
@@ -94,6 +98,12 @@ class RaidState:
             + self.reserve["dd"]
         )
 
+    def all_user_ids(self) -> list[int]:
+        return list(set(
+            self.all_main_ids()
+            + self.all_reserve_ids()
+        ))
+
     def current_main_count(self) -> int:
         return len(self.all_main_ids())
 
@@ -111,7 +121,10 @@ class RaidState:
             "start_ts": self.start_ts,
             "main": self.main,
             "reserve": self.reserve,
-            "ended": self.ended
+            "ended": self.ended,
+            "notified_30": self.notified_30,
+            "notified_15": self.notified_15,
+            "notified_start": self.notified_start
         }
 
     @classmethod
@@ -162,6 +175,10 @@ class RaidStore:
     def add(self, raid: RaidState) -> None:
         self.raids[raid.raid_id] = raid
 
+    def remove(self, raid_id: str) -> None:
+        if raid_id in self.raids:
+            del self.raids[raid_id]
+
     def get_by_message(
         self,
         message_id: int
@@ -178,6 +195,7 @@ store = RaidStore(DATA_FILE)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -278,16 +296,54 @@ async def refresh_raid_message(
     ):
         return
 
-    message = await channel.fetch_message(
-        raid.message_id
-    )
+    try:
+        message = await channel.fetch_message(
+            raid.message_id
+        )
 
-    await message.edit(
-        embed=build_raid_embed(raid),
-        view=RaidView()
-    )
+        await message.edit(
+            embed=build_raid_embed(raid),
+            view=RaidView()
+        )
+
+    except discord.NotFound:
+        return
 
     await store.save()
+
+
+async def send_raid_notification(
+    raid: RaidState,
+    text: str
+):
+    channel = bot.get_channel(
+        raid.channel_id
+    )
+
+    if not isinstance(
+        channel,
+        discord.TextChannel
+    ):
+        return
+
+    mentions = " ".join(
+        f"<@{uid}>"
+        for uid in raid.all_user_ids()
+    )
+
+    if not mentions:
+        return
+
+    try:
+        await channel.send(
+            f"{mentions}\n{text}"
+        )
+
+    except Exception as e:
+        log.error(
+            "Notification error: %s",
+            e
+        )
 
 
 class RaidView(discord.ui.View):
@@ -520,6 +576,97 @@ class RaidView(discord.ui.View):
         )
 
 
+@tasks.loop(minutes=1)
+async def raid_notifications():
+
+    now_ts = int(datetime.now(
+        tz=MOSCOW_TZ
+    ).timestamp())
+
+    raids_to_delete = []
+
+    for raid in store.raids.values():
+
+        diff = raid.start_ts - now_ts
+
+        if (
+            diff <= 1800
+            and not raid.notified_30
+        ):
+            await send_raid_notification(
+                raid,
+                f"⏰ Рейд **{raid.title}** начнётся через 30 минут!"
+            )
+
+            raid.notified_30 = True
+            await store.save()
+
+        if (
+            diff <= 900
+            and not raid.notified_15
+        ):
+            await send_raid_notification(
+                raid,
+                f"⚠️ Рейд **{raid.title}** начнётся через 15 минут!"
+            )
+
+            raid.notified_15 = True
+            await store.save()
+
+        if (
+            diff <= 0
+            and not raid.notified_start
+        ):
+            await send_raid_notification(
+                raid,
+                f"🔥 Рейд **{raid.title}** начинается прямо сейчас!"
+            )
+
+            raid.notified_start = True
+            await store.save()
+
+        if diff <= -7200:
+            raids_to_delete.append(raid)
+
+    for raid in raids_to_delete:
+
+        channel = bot.get_channel(
+            raid.channel_id
+        )
+
+        if isinstance(
+            channel,
+            discord.TextChannel
+        ):
+
+            try:
+                message = await channel.fetch_message(
+                    raid.message_id
+                )
+
+                await message.delete()
+
+            except Exception:
+                pass
+
+            if raid.thread_id:
+
+                thread = channel.get_thread(
+                    raid.thread_id
+                )
+
+                if thread:
+                    try:
+                        await thread.delete()
+                    except Exception:
+                        pass
+
+        store.remove(raid.raid_id)
+
+    if raids_to_delete:
+        await store.save()
+
+
 @bot.tree.command(
     name="raid_create",
     description="Создать рейд"
@@ -564,12 +711,16 @@ async def raid_create(
 
     raid_id = str(message.id)
 
+    thread = await message.create_thread(
+        name=f"Рейд | {title}"
+    )
+
     raid = RaidState(
         raid_id=raid_id,
         guild_id=interaction.guild.id,
         channel_id=interaction.channel.id,
         message_id=message.id,
-        thread_id=None,
+        thread_id=thread.id,
         title=title,
         start_ts=start_ts
     )
@@ -581,6 +732,10 @@ async def raid_create(
         view=RaidView()
     )
 
+    await thread.send(
+        f"🧵 Ветка для обсуждения рейда **{title}**"
+    )
+
     await store.save()
 
 
@@ -588,6 +743,8 @@ async def raid_create(
 async def setup_hook():
 
     bot.add_view(RaidView())
+
+    raid_notifications.start()
 
     guild_id = os.getenv("GUILD_ID")
 
