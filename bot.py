@@ -98,18 +98,6 @@ class RaidState:
             + self.reserve["dd"]
         )
 
-    def all_user_ids(self) -> list[int]:
-        return list(set(
-            self.all_main_ids()
-            + self.all_reserve_ids()
-        ))
-
-    def current_main_count(self) -> int:
-        return len(self.all_main_ids())
-
-    def current_reserve_count(self) -> int:
-        return len(self.all_reserve_ids())
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "raid_id": self.raid_id,
@@ -152,8 +140,6 @@ class RaidStore:
             for raid_id, data in raw.items()
         }
 
-        log.info("Loaded %s raids", len(self.raids))
-
     async def save(self) -> None:
         async with self.lock:
             payload = {
@@ -175,10 +161,6 @@ class RaidStore:
     def add(self, raid: RaidState) -> None:
         self.raids[raid.raid_id] = raid
 
-    def remove(self, raid_id: str) -> None:
-        if raid_id in self.raids:
-            del self.raids[raid_id]
-
     def get_by_message(
         self,
         message_id: int
@@ -195,7 +177,6 @@ store = RaidStore(DATA_FILE)
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -296,54 +277,29 @@ async def refresh_raid_message(
     ):
         return
 
-    try:
-        message = await channel.fetch_message(
-            raid.message_id
-        )
+    message = await channel.fetch_message(
+        raid.message_id
+    )
 
-        await message.edit(
-            embed=build_raid_embed(raid),
-            view=RaidView()
-        )
+    view = RaidView()
 
-    except discord.NotFound:
-        return
+    if int(datetime.now(
+        tz=MOSCOW_TZ
+    ).timestamp()) >= raid.start_ts:
+
+        for item in view.children:
+            if isinstance(
+                item,
+                discord.ui.Button
+            ):
+                item.disabled = True
+
+    await message.edit(
+        embed=build_raid_embed(raid),
+        view=view
+    )
 
     await store.save()
-
-
-async def send_raid_notification(
-    raid: RaidState,
-    text: str
-):
-    channel = bot.get_channel(
-        raid.channel_id
-    )
-
-    if not isinstance(
-        channel,
-        discord.TextChannel
-    ):
-        return
-
-    mentions = " ".join(
-        f"<@{uid}>"
-        for uid in raid.all_user_ids()
-    )
-
-    if not mentions:
-        return
-
-    try:
-        await channel.send(
-            f"{mentions}\n{text}"
-        )
-
-    except Exception as e:
-        log.error(
-            "Notification error: %s",
-            e
-        )
 
 
 class RaidView(discord.ui.View):
@@ -365,8 +321,15 @@ class RaidView(discord.ui.View):
         )
 
         if raid is None:
+            return
+
+        now_ts = int(datetime.now(
+            tz=MOSCOW_TZ
+        ).timestamp())
+
+        if now_ts >= raid.start_ts:
             await interaction.response.send_message(
-                "Рейд не найден.",
+                "Рейд уже начался.",
                 ephemeral=True
             )
             return
@@ -377,10 +340,11 @@ class RaidView(discord.ui.View):
         )
 
         if reserve:
-            if (
-                raid.current_reserve_count()
-                >= MAX_RESERVE
-            ):
+
+            if len(
+                raid.all_reserve_ids()
+            ) >= MAX_RESERVE:
+
                 await interaction.response.send_message(
                     "Резерв заполнен.",
                     ephemeral=True
@@ -391,17 +355,12 @@ class RaidView(discord.ui.View):
                 interaction.user.id
             )
 
-            text = (
-                f"Ты записан(а) "
-                f"в резерв как "
-                f"{ROLE_LABELS[role]}."
-            )
-
         else:
-            if (
-                len(raid.main[role])
-                >= ROLE_LIMITS[role]
-            ):
+
+            if len(
+                raid.main[role]
+            ) >= ROLE_LIMITS[role]:
+
                 await interaction.response.send_message(
                     "Слот занят.",
                     ephemeral=True
@@ -412,16 +371,12 @@ class RaidView(discord.ui.View):
                 interaction.user.id
             )
 
-            text = (
-                f"Ты записан(а) "
-                f"в основу как "
-                f"{ROLE_LABELS[role]}."
-            )
-
-        await refresh_raid_message(raid)
+        await refresh_raid_message(
+            raid
+        )
 
         await interaction.response.send_message(
-            text,
+            "Запись обновлена.",
             ephemeral=True
         )
 
@@ -568,103 +523,14 @@ class RaidView(discord.ui.View):
             )
             return
 
-        await refresh_raid_message(raid)
+        await refresh_raid_message(
+            raid
+        )
 
         await interaction.response.send_message(
             "Ты убран(а) из рейда.",
             ephemeral=True
         )
-
-
-@tasks.loop(minutes=1)
-async def raid_notifications():
-
-    now_ts = int(datetime.now(
-        tz=MOSCOW_TZ
-    ).timestamp())
-
-    raids_to_delete = []
-
-    for raid in store.raids.values():
-
-        diff = raid.start_ts - now_ts
-
-        if (
-            diff <= 1800
-            and not raid.notified_30
-        ):
-            await send_raid_notification(
-                raid,
-                f"⏰ Рейд **{raid.title}** начнётся через 30 минут!"
-            )
-
-            raid.notified_30 = True
-            await store.save()
-
-        if (
-            diff <= 900
-            and not raid.notified_15
-        ):
-            await send_raid_notification(
-                raid,
-                f"⚠️ Рейд **{raid.title}** начнётся через 15 минут!"
-            )
-
-            raid.notified_15 = True
-            await store.save()
-
-        if (
-            diff <= 0
-            and not raid.notified_start
-        ):
-            await send_raid_notification(
-                raid,
-                f"🔥 Рейд **{raid.title}** начинается прямо сейчас!"
-            )
-
-            raid.notified_start = True
-            await store.save()
-
-        if diff <= -7200:
-            raids_to_delete.append(raid)
-
-    for raid in raids_to_delete:
-
-        channel = bot.get_channel(
-            raid.channel_id
-        )
-
-        if isinstance(
-            channel,
-            discord.TextChannel
-        ):
-
-            try:
-                message = await channel.fetch_message(
-                    raid.message_id
-                )
-
-                await message.delete()
-
-            except Exception:
-                pass
-
-            if raid.thread_id:
-
-                thread = channel.get_thread(
-                    raid.thread_id
-                )
-
-                if thread:
-                    try:
-                        await thread.delete()
-                    except Exception:
-                        pass
-
-        store.remove(raid.raid_id)
-
-    if raids_to_delete:
-        await store.save()
 
 
 @bot.tree.command(
@@ -673,8 +539,8 @@ async def raid_notifications():
 )
 @app_commands.describe(
     title="Название рейда",
-    date="Дата в формате ДД.ММ.ГГГГ",
-    time="Время в формате ЧЧ:ММ"
+    date="Дата ДД.ММ.ГГГГ",
+    time="Время ЧЧ:ММ"
 )
 async def raid_create(
     interaction: discord.Interaction,
@@ -698,43 +564,165 @@ async def raid_create(
 
     start_ts = int(dt.timestamp())
 
-    embed = discord.Embed(
-        title="Создание рейда...",
-        color=discord.Color.blurple()
-    )
+    channel = interaction.channel
 
-    await interaction.response.send_message(
-        embed=embed
-    )
-
-    message = await interaction.original_response()
-
-    raid_id = str(message.id)
-
-    thread = await message.create_thread(
-        name=f"Рейд | {title}"
-    )
+    if not isinstance(
+        channel,
+        discord.TextChannel
+    ):
+        return
 
     raid = RaidState(
-        raid_id=raid_id,
+        raid_id="temp",
         guild_id=interaction.guild.id,
-        channel_id=interaction.channel.id,
-        message_id=message.id,
-        thread_id=thread.id,
+        channel_id=channel.id,
+        message_id=0,
+        thread_id=None,
         title=title,
         start_ts=start_ts
     )
 
-    store.add(raid)
-
-    await message.edit(
+    message = await channel.send(
         embed=build_raid_embed(raid),
         view=RaidView()
     )
 
-    await thread.send(
-        f"🧵 Ветка для обсуждения рейда **{title}**"
+    thread = await message.create_thread(
+        name=f"🗡️ {title}"
     )
+
+    await thread.send(
+        f"Обсуждение рейда "
+        f"**{title}** открыто."
+    )
+
+    raid.raid_id = str(message.id)
+    raid.message_id = message.id
+    raid.thread_id = thread.id
+
+    store.add(raid)
+
+    await store.save()
+
+    await interaction.response.send_message(
+        "Рейд создан.",
+        ephemeral=True
+    )
+
+
+@tasks.loop(minutes=1)
+async def raid_tasks():
+
+    now_ts = int(datetime.now(
+        tz=MOSCOW_TZ
+    ).timestamp())
+
+    to_delete = []
+
+    for raid_id, raid in store.raids.items():
+
+        channel = bot.get_channel(
+            raid.channel_id
+        )
+
+        if not isinstance(
+            channel,
+            discord.TextChannel
+        ):
+            continue
+
+        all_users = list(set(
+            raid.all_main_ids()
+            + raid.all_reserve_ids()
+        ))
+
+        mentions = " ".join(
+            f"<@{uid}>"
+            for uid in all_users
+        )
+
+        # УВЕДОМЛЕНИЕ ЗА 30 МИН
+        if (
+            not raid.notified_30
+            and now_ts >= raid.start_ts - 1800
+        ):
+
+            await channel.send(
+                f"⏰ Рейд **{raid.title}** "
+                f"через 30 минут.\n"
+                f"{mentions}"
+            )
+
+            raid.notified_30 = True
+
+        # УВЕДОМЛЕНИЕ ЗА 15 МИН
+        if (
+            not raid.notified_15
+            and now_ts >= raid.start_ts - 900
+        ):
+
+            await channel.send(
+                f"⚔️ Рейд **{raid.title}** "
+                f"через 15 минут.\n"
+                f"{mentions}"
+            )
+
+            raid.notified_15 = True
+
+        # НАЧАЛО РЕЙДА
+        if (
+            not raid.notified_start
+            and now_ts >= raid.start_ts
+        ):
+
+            await channel.send(
+                f"🔥 Рейд **{raid.title}** "
+                f"начался!\n"
+                f"{mentions}"
+            )
+
+            raid.notified_start = True
+
+            await refresh_raid_message(
+                raid
+            )
+
+        # УДАЛЕНИЕ ЧЕРЕЗ 2 ЧАСА
+        if now_ts >= raid.start_ts + 7200:
+
+            try:
+                message = await channel.fetch_message(
+                    raid.message_id
+                )
+
+                await message.delete()
+
+            except Exception:
+                pass
+
+            if raid.thread_id:
+
+                thread = channel.guild.get_thread(
+                    raid.thread_id
+                )
+
+                if thread:
+
+                    try:
+                        await thread.delete()
+
+                    except Exception:
+                        pass
+
+            to_delete.append(
+                raid_id
+            )
+
+    for raid_id in to_delete:
+        store.raids.pop(
+            raid_id,
+            None
+        )
 
     await store.save()
 
@@ -742,13 +730,16 @@ async def raid_create(
 @bot.event
 async def setup_hook():
 
-    bot.add_view(RaidView())
+    bot.add_view(
+        RaidView()
+    )
 
-    raid_notifications.start()
-
-    guild_id = os.getenv("GUILD_ID")
+    guild_id = os.getenv(
+        "GUILD_ID"
+    )
 
     if guild_id:
+
         guild = discord.Object(
             id=int(guild_id)
         )
@@ -761,16 +752,8 @@ async def setup_hook():
             guild=guild
         )
 
-        log.info(
-            "Commands synced to guild"
-        )
-
     else:
         await bot.tree.sync()
-
-        log.info(
-            "Global commands synced"
-        )
 
 
 @bot.event
@@ -783,12 +766,17 @@ async def on_ready():
             bot.user.id
         )
 
+    if not raid_tasks.is_running():
+        raid_tasks.start()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+
+TOKEN = os.getenv(
+    "DISCORD_TOKEN"
+)
 
 if not TOKEN:
     raise RuntimeError(
         "DISCORD_TOKEN is not set"
     )
 
-bot.run(TOKEN)
+bot.run(TOK
