@@ -43,6 +43,7 @@ class RaidState:
     sent_alerts: list[str] = field(default_factory=list)
     ended: bool = False
     cleanup_done: bool = False
+    full_notified: bool = False
 
     @property
     def start_dt(self) -> datetime:
@@ -78,10 +79,12 @@ class RaidState:
             "sent_alerts": self.sent_alerts,
             "ended": self.ended,
             "cleanup_done": self.cleanup_done,
+            "full_notified": self.full_notified,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RaidState":
+        data.setdefault("full_notified", False)
         return cls(**data)
 
 
@@ -144,7 +147,7 @@ def build_raid_embed(raid: RaidState) -> discord.Embed:
             f"**Локальное время:** ({local_full})\n"
             f"**Коротко:** {msk_str.split()[1]} МСК ({local_short})\n\n"
             f"**Состав:** 1 танк / 2 хила / 7 дд\n"
-            f"**Резерв:** до 5 человек, без автоматического поднятия\n\n"
+            f"**Резерв:** до 5 человек, автоподнятие по классу\n\n"
             f"{ROLE_EMOJIS['tank']} **Танки [{len(raid.main['tank'])}/{ROLE_LIMITS['tank']}]**\n"
             f"{format_user_list(raid.main['tank'])}\n"
             f"—\n"
@@ -213,6 +216,51 @@ def promote_from_reserve(raid: RaidState) -> list[str]:
     return moves
 
 
+def is_main_full(raid: RaidState) -> bool:
+    return all(len(raid.main[role]) >= ROLE_LIMITS[role] for role in ("tank", "heal", "dd"))
+
+
+def missing_main_text(raid: RaidState) -> str:
+    missing: list[str] = []
+    for role in ("tank", "heal", "dd"):
+        need = ROLE_LIMITS[role] - len(raid.main[role])
+        if need > 0:
+            missing.append(f"{ROLE_EMOJIS[role]} {ROLE_LABELS[role]}: {need}")
+    return "\n".join(missing) if missing else "—"
+
+
+def full_main_text(raid: RaidState) -> str:
+    return (
+        f"✅ **Основной состав рейда собран (10/10).**\n\n"
+        f"{ROLE_EMOJIS['tank']} Танки: {len(raid.main['tank'])}/{ROLE_LIMITS['tank']}\n"
+        f"{ROLE_EMOJIS['heal']} Хилы: {len(raid.main['heal'])}/{ROLE_LIMITS['heal']}\n"
+        f"{ROLE_EMOJIS['dd']} ДД: {len(raid.main['dd'])}/{ROLE_LIMITS['dd']}"
+    )
+
+
+def not_full_anymore_text(raid: RaidState) -> str:
+    return (
+        "⚠️ **Основной состав больше не полный.**\n\n"
+        "**Не хватает:**\n"
+        f"{missing_main_text(raid)}"
+    )
+
+
+async def send_to_raid_thread(raid: RaidState, content: str) -> None:
+    if not raid.thread_id:
+        return
+
+    thread = bot.get_channel(raid.thread_id)
+    if thread is None:
+        try:
+            thread = await bot.fetch_channel(raid.thread_id)
+        except discord.HTTPException:
+            thread = None
+
+    if isinstance(thread, discord.Thread):
+        await thread.send(content, allowed_mentions=discord.AllowedMentions(users=True))
+
+
 async def refresh_raid_message(raid: RaidState, extra_thread_message: str | None = None) -> None:
     channel = bot.get_channel(raid.channel_id) or await bot.fetch_channel(raid.channel_id)
     if not isinstance(channel, discord.TextChannel):
@@ -258,6 +306,8 @@ class RaidView(discord.ui.View):
             return
 
         user_id = interaction.user.id
+        was_full = is_main_full(raid)
+
         remove_everywhere(raid, user_id)
 
         if reserve:
@@ -268,6 +318,7 @@ class RaidView(discord.ui.View):
                 return
             raid.reserve[role].append(user_id)
             message = f"Ты записан(а) в резерв как {ROLE_LABELS[role]}."
+            thread_log = f"{ROLE_EMOJIS[role]} <@{user_id}> записался(ась) в резерв как **{ROLE_LABELS[role]}**."
         else:
             ok, error = can_join_main(raid, role)
             if not ok:
@@ -276,8 +327,25 @@ class RaidView(discord.ui.View):
                 return
             raid.main[role].append(user_id)
             message = f"Ты записан(а) в основу как {ROLE_LABELS[role]}."
+            thread_log = f"{ROLE_EMOJIS[role]} <@{user_id}> записался(ась) в основу как **{ROLE_LABELS[role]}**."
+
+        promotions = promote_from_reserve(raid)
 
         await refresh_raid_message(raid)
+        await send_to_raid_thread(raid, thread_log)
+
+        if promotions:
+            await send_to_raid_thread(raid, "\n".join(promotions))
+
+        now_full = is_main_full(raid)
+        if now_full and not raid.full_notified:
+            raid.full_notified = True
+            await send_to_raid_thread(raid, full_main_text(raid))
+        elif was_full and not now_full:
+            raid.full_notified = False
+            await send_to_raid_thread(raid, not_full_anymore_text(raid))
+
+        await store.save()
         await interaction.response.send_message(message, ephemeral=True)
 
     @discord.ui.button(label="Основа: Танк", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="raid:main:tank", row=0)
@@ -315,12 +383,29 @@ class RaidView(discord.ui.View):
             await interaction.response.send_message("Этот рейд уже удалён или не найден.", ephemeral=True)
             return
 
+        was_full = is_main_full(raid)
         removed, message = remove_everywhere(raid, interaction.user.id)
         if not removed:
             await interaction.response.send_message("Тебя нет в этом рейде.", ephemeral=True)
             return
 
+        promotions = promote_from_reserve(raid)
+
         await refresh_raid_message(raid)
+        await send_to_raid_thread(raid, f"❌ <@{interaction.user.id}> отменил(а) запись.")
+
+        if promotions:
+            await send_to_raid_thread(raid, "\n".join(promotions))
+
+        now_full = is_main_full(raid)
+        if now_full and not raid.full_notified:
+            raid.full_notified = True
+            await send_to_raid_thread(raid, full_main_text(raid))
+        elif was_full and not now_full:
+            raid.full_notified = False
+            await send_to_raid_thread(raid, not_full_anymore_text(raid))
+
+        await store.save()
         await interaction.response.send_message(message, ephemeral=True)
 
 
