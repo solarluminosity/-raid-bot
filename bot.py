@@ -26,7 +26,7 @@ MAX_RESERVE = 5
 ROLE_LIMITS = {"tank": 1, "heal": 2, "dd": 7}
 ROLE_LABELS = {"tank": "Танк", "heal": "Хил", "dd": "ДД"}
 ROLE_EMOJIS = {"tank": "🛡️", "heal": "🌿", "dd": "⚔️"}
-FIXED_ALERT_MINUTES = 5
+ALERT_MINUTES = [30, 15]
 
 
 @dataclass
@@ -144,7 +144,7 @@ def build_raid_embed(raid: RaidState) -> discord.Embed:
             f"**Локальное время:** ({local_full})\n"
             f"**Коротко:** {msk_str.split()[1]} МСК ({local_short})\n\n"
             f"**Состав:** 1 танк / 2 хила / 7 дд\n"
-            f"**Резерв:** до 5 человек, автоподнятие по классу\n\n"
+            f"**Резерв:** до 5 человек, без автоматического поднятия\n\n"
             f"{ROLE_EMOJIS['tank']} **Танки [{len(raid.main['tank'])}/{ROLE_LIMITS['tank']}]**\n"
             f"{format_user_list(raid.main['tank'])}\n"
             f"—\n"
@@ -173,7 +173,7 @@ def build_raid_embed(raid: RaidState) -> discord.Embed:
     status = "Завершён" if raid.ended else "Активен"
     embed.set_footer(
         text="Статус: "
-        f"{status} • Напоминания: за 60 мин, за 5 мин и в момент старта"
+        f"{status} • Напоминания: за 30 мин, за 15 мин и в момент старта"
     )
     return embed
 
@@ -247,6 +247,12 @@ class RaidView(discord.ui.View):
         if raid is None:
             await interaction.response.send_message("Этот рейд уже удалён или не найден.", ephemeral=True)
             return
+        if datetime.now(MOSCOW_TZ) >= raid.start_dt:
+            raid.ended = True
+            await store.save()
+            await interaction.response.send_message("Запись уже закрыта: рейд начался.", ephemeral=True)
+            return
+
         if raid.ended:
             await interaction.response.send_message("Рейд уже завершён.", ephemeral=True)
             return
@@ -271,8 +277,7 @@ class RaidView(discord.ui.View):
             raid.main[role].append(user_id)
             message = f"Ты записан(а) в основу как {ROLE_LABELS[role]}."
 
-        promotions = promote_from_reserve(raid)
-        await refresh_raid_message(raid, "\n".join(promotions) if promotions else None)
+        await refresh_raid_message(raid)
         await interaction.response.send_message(message, ephemeral=True)
 
     @discord.ui.button(label="Основа: Танк", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="raid:main:tank", row=0)
@@ -315,9 +320,7 @@ class RaidView(discord.ui.View):
             await interaction.response.send_message("Тебя нет в этом рейде.", ephemeral=True)
             return
 
-        promotions = promote_from_reserve(raid)
-        thread_message = "\n".join(promotions) if promotions else None
-        await refresh_raid_message(raid, thread_message)
+        await refresh_raid_message(raid)
         await interaction.response.send_message(message, ephemeral=True)
 
 
@@ -478,7 +481,6 @@ async def send_and_autodelete(channel: discord.TextChannel, content: str) -> Non
 
 @tasks.loop(seconds=20)
 async def scheduler() -> None:
-    log.info("Scheduler tick")
     now = datetime.now(MOSCOW_TZ)
     to_remove: list[str] = []
 
@@ -495,8 +497,8 @@ async def scheduler() -> None:
             continue
 
         alerts = {
-            "60": start_dt - timedelta(hours=1),
-            "5": start_dt - timedelta(minutes=FIXED_ALERT_MINUTES),
+            "30": start_dt - timedelta(minutes=30),
+            "15": start_dt - timedelta(minutes=15),
             "start": start_dt,
         }
 
@@ -504,14 +506,23 @@ async def scheduler() -> None:
             if key in raid.sent_alerts:
                 continue
             if now >= alert_time:
-                if key == "60":
-                    text = f"⏰ **До рейда {raid.title} остался 1 час!**\nУчастники: {raid.mentions_main()}"
-                elif key == "start":
-                    text = f"🚨 **Рейд {raid.title} начинается прямо сейчас!**\nУчастники: {raid.mentions_main()}"
+                if key == "30":
+                    text = f"⏰ **До рейда {raid.title} осталось 30 минут!**\nУчастники: {raid.mentions_main()}"
+                elif key == "15":
+                    text = f"⚠️ **До рейда {raid.title} осталось 15 минут!**\nУчастники: {raid.mentions_main()}"
                 else:
-                    text = f"⚠️ **До рейда {raid.title} осталось 5 мин!**\nУчастники: {raid.mentions_main()}"
+                    text = f"🚨 **Рейд {raid.title} начинается прямо сейчас!**\nУчастники: {raid.mentions_main()}"
 
                 await send_and_autodelete(channel, text)
+
+                if raid.thread_id:
+                    try:
+                        thread = bot.get_channel(raid.thread_id) or await bot.fetch_channel(raid.thread_id)
+                        if isinstance(thread, discord.Thread):
+                            await thread.send(text, allowed_mentions=discord.AllowedMentions(users=True))
+                    except discord.HTTPException:
+                        pass
+
                 raid.sent_alerts.append(key)
                 await store.save()
 
@@ -524,7 +535,7 @@ async def scheduler() -> None:
                 pass
             await store.save()
 
-        if not raid.cleanup_done and now >= start_dt + timedelta(minutes=30):
+        if not raid.cleanup_done and now >= start_dt + timedelta(hours=2):
             raid.cleanup_done = True
             try:
                 message = await channel.fetch_message(raid.message_id)
