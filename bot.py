@@ -334,6 +334,7 @@ async def setup_hook() -> None:
         await bot.tree.sync()
         log.info("Synced global commands")
     scheduler.start()
+    log.info("Scheduler started")
 
 
 @bot.event
@@ -396,18 +397,24 @@ async def raid_create(
     await interaction.response.defer(ephemeral=True)
 
     placeholder = await target_channel.send("Создаю рейд…")
-    thread = await placeholder.create_thread(
-        name=f"Обсуждение: {title}",
-        auto_archive_duration=1440,
-        reason=f"Raid thread for {title}",
-    )
+
+    try:
+        thread = await placeholder.create_thread(
+            name=f"Обсуждение: {title}",
+            auto_archive_duration=1440,
+            reason=f"Raid thread for {title}",
+        )
+        log.info(f"Thread created: {thread.id}")
+    except Exception as e:
+        log.exception(f"Failed to create thread: {e}")
+        thread = None
 
     raid = RaidState(
         raid_id=str(placeholder.id),
         guild_id=interaction.guild_id or 0,
         channel_id=target_channel.id,
         message_id=placeholder.id,
-        thread_id=thread.id,
+        thread_id=thread.id if thread else None,
         title=title,
         start_ts=int(start_dt.timestamp()),
     )
@@ -471,6 +478,7 @@ async def send_and_autodelete(channel: discord.TextChannel, content: str) -> Non
 
 @tasks.loop(seconds=20)
 async def scheduler() -> None:
+    log.info("Scheduler tick")
     now = datetime.now(MOSCOW_TZ)
     to_remove: list[str] = []
 
